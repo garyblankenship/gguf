@@ -13,6 +13,8 @@ GGUF is a powerful bash script for managing and interacting with large language 
 - Monitor running model servers
 - Fetch recent and trending GGUF models from Hugging Face
 
+![gguf](https://github.com/user-attachments/assets/556c982b-aa99-4aec-9276-f0432df21ae3)
+
 ## 📋 Prerequisites
 
 Before you begin, ensure you have the following installed:
