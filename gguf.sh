@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 🦙 Welcome to the GGUF (Groovy GGUF Utility Functions) script! 🚀
+# 🦙 Welcome to the GGUF (Groovy GGML Utility Functions) script! 🚀
 #
 # Prerequisites (because even llamas need tools):
 # - llama-server command (macOS: brew install llama.cpp)
@@ -23,7 +23,8 @@ MODELS_DIR="$HOME/.cache/gguf/models/"
 LLAMA_SERVER="/opt/homebrew/bin/llama-server"
 LLAMA_CLI="/opt/homebrew/bin/llama-cli"
 DB_PATH="$HOME/.cache/gguf/gguf.db"
-DEFAULT_PORT=1979
+DEFAULT_PORT=1966
+API_URL="${API_URL:-http://localhost:$DEFAULT_PORT}"
 
 # Model parameters
 TEMPERATURE=0.7
@@ -32,8 +33,29 @@ TOP_P=0.5
 N_PREDICT=256
 
 # Helper Functions
+trim() {
+    shopt -s extglob
+    set -- "${1##+([[:space:]])}"
+    printf "%s" "${1%%+([[:space:]])}"
+}
+
+trim_trailing() {
+    shopt -s extglob
+    printf "%s" "${1%%+([[:space:]])}"
+}
+
 trim_blank_lines() {
     sed '/^[[:space:]]*$/d'
+}
+
+tokenize() {
+    curl \
+        --silent \
+        --request POST \
+        --url "${API_URL}/tokenize" \
+        --header "Content-Type: application/json" \
+        --data-raw "$(jq -ns --arg content "$1" '{content:$content}')" \
+    | jq '.tokens[]'
 }
 
 ensure_server_running() {
@@ -45,7 +67,14 @@ ensure_server_running() {
     if ! pgrep -f "llama-server.*$model_path" > /dev/null; then
         log_info "Starting server for model $slug..."
         local log_file="/tmp/llama_server_${slug}.log"
-        nohup "$LLAMA_SERVER" -m "$model_path" --port "$DEFAULT_PORT" > "$log_file" 2>&1 &
+        local all_model_paths
+        all_model_paths=$(sqlite3 "$DB_PATH" "SELECT file_path FROM models WHERE slug='$slug';")
+        IFS=';' read -ra model_paths <<< "$all_model_paths"
+        local model_args=""
+        for path in "${model_paths[@]}"; do
+            model_args="$model_args -m \"$path\""
+        done
+        nohup bash -c "$LLAMA_SERVER $model_args --port $DEFAULT_PORT > $log_file 2>&1" &
         local server_pid=$!
         log_info "Server started with PID $server_pid. Logs: $log_file"
 
@@ -101,6 +130,10 @@ handle_response() {
 
 # Initialize the database if it doesn't exist
 init_database() {
+    # Ensure the directory exists
+    mkdir -p "$(dirname "$DB_PATH")"
+    mkdir -p "$MODELS_DIR"
+
     sqlite3 "$DB_PATH" <<EOF
     CREATE TABLE IF NOT EXISTS models (
         id INTEGER PRIMARY KEY,
@@ -131,7 +164,7 @@ validate_model_id() {
 
 generate_slug() {
     local model_path="$1"
-    echo "$model_path" | sed 's|.*/||; s|/|-|g; s|[[:upper:]]|\\L&|g; s|[^a-z0-9]|-|g; s|--*|-|g; s|^-||; s|-$||'
+    echo "$model_path" | sed 's|.*/||; s|/[^/]*$||; s|/|-|g' | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//; s/-$//'
 }
 
 add_model_to_db() {
@@ -149,7 +182,8 @@ get_model_path() {
         list_models >&2
         return 1
     fi
-    echo "$result"
+    # If there are multiple paths, return the first one
+    echo "$result" | cut -d';' -f1
 }
 
 update_last_used() {
@@ -169,11 +203,11 @@ list_models() {
         return 0
     fi
     (
-        echo "SLUG|MODEL|SIZE|LAST USED"
+        echo "SLUG|MODEL ID|SIZE|LAST USED"
         sqlite3 -separator "|" "$DB_PATH" "
         SELECT 
             slug, 
-            file_name,
+            model_id,
             file_size,
             COALESCE(datetime(last_used), 'Never') as last_used 
         FROM models 
@@ -202,24 +236,40 @@ pull_model() {
         return 0
     fi
 
-    log_info "Downloading Q4_K_M.gguf file for model $model_id..."
-    huggingface-cli download "$model_id" --include "*Q4_K_M.gguf" --local-dir "$model_dir"
+    log_info "Fetching model information for $model_id..."
+    local api_url="https://huggingface.co/api/models/$model_id?filter=gguf&sort=lastModified"
+    local model_info
+    model_info=$(curl -s "$api_url")
 
-    local downloaded_file
-    downloaded_file=$(find "$model_dir" -name "*Q4_K_M.gguf")
+    if [ -z "$model_info" ]; then
+        log_error "Failed to fetch model information for $model_id"
+        return 1
+    fi
 
-    if [ -n "$downloaded_file" ]; then
+    local file_to_download
+    file_to_download=$(echo "$model_info" | jq -r '.siblings[] | select(.rfilename | ascii_downcase | endswith("q4_k_m.gguf")) | .rfilename' | head -n 1)
+
+    if [ -z "$file_to_download" ]; then
+        log_error "No q4_k_m.gguf file found for $model_id"
+        return 1
+    fi
+
+    log_info "Downloading $file_to_download for model $model_id..."
+    mkdir -p "$model_dir"
+    huggingface-cli download "$model_id" "$file_to_download" --local-dir "$model_dir"
+
+    local downloaded_file="$model_dir/$file_to_download"
+    if [ -f "$downloaded_file" ]; then
         local file_size
         file_size=$(du -h "$downloaded_file" | cut -f1)
         local slug
         slug=$(generate_slug "$model_id")
-        local file_name
-        file_name=$(basename "$downloaded_file")
-        add_model_to_db "$slug" "$model_id" "$file_name" "$downloaded_file" "$file_size"
+        add_model_to_db "$slug" "$model_id" "$file_to_download" "$downloaded_file" "$file_size"
         log_info "Model added to database with slug: $slug"
         echo "To use this model, run: gguf chat $slug"
     else
-        log_error "No Q4_K_M.gguf file found after download attempt."
+        log_error "Failed to download $file_to_download from $model_id"
+        log_info "You can try downloading manually and then use 'gguf import' to add it to the database."
     fi
 }
 
@@ -272,7 +322,7 @@ import_existing_models() {
     find "$MODELS_DIR" -type f -name "*.gguf" | while read -r file_path; do
         local file_name model_id slug file_size
         file_name=$(basename "$file_path")
-        model_id=$(echo "$file_path" | sed "s|$MODELS_DIR/||")
+        model_id=$(echo "$file_path" | sed "s|$MODELS_DIR/||" | sed 's|/[^/]*$||')
         slug=$(generate_slug "$model_id")
         file_size=$(du -h "$file_path" | cut -f1)
         local existing
@@ -371,38 +421,49 @@ run_model() {
 }
 
 kill_model() {
-    local slug="$1"
-    if [ "$slug" == "--help" ]; then
-        echo "Usage: gguf kill <slug|all>"
-        echo "Kill the server running the specified model or all servers."
+    local target="$1"
+    if [ "$target" == "--help" ]; then
+        echo "Usage: gguf kill <slug|pid|all>"
+        echo "Kill the server running the specified model, a specific process, or all servers."
         echo
         echo "Arguments:"
-        echo "  <slug>  The slug of the model to kill, or 'all' to kill all servers"
+        echo "  <slug>  The slug of the model to kill"
+        echo "  <pid>   The process ID to kill"
+        echo "  all     Kill all llama-server processes"
         echo
-        echo "Use 'gguf ps' to see running models."
+        echo "Use 'gguf ps' to see running models and their PIDs."
         return 0
     fi
-    if [ -z "$slug" ]; then
-        log_error "No model slug provided. Usage: gguf kill <slug>"
-        log_info "Use 'gguf ps' to see running models."
+    if [ -z "$target" ]; then
+        log_error "No target provided. Usage: gguf kill <slug|pid|all>"
+        log_info "Use 'gguf ps' to see running models and their PIDs."
         return 1
     fi
 
-    local pids
-    pids=$(ps aux | grep "[l]lama-server.*$slug" | awk '{print $2}')
-    if [ -z "$pids" ]; then
-        log_warn "No running server found for model '$slug'."
-        return 1
-    fi
-
-    for pid in $pids; do
-        kill "$pid"
-        if [ $? -eq 0 ]; then
-            log_info "Server for model '$slug' (PID: $pid) terminated."
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        # If target is a numeric PID
+        if kill "$target" 2>/dev/null; then
+            log_info "Process with PID $target terminated."
         else
-            log_error "Failed to terminate server for model '$slug' (PID: $pid)."
+            log_error "Failed to terminate process with PID $target."
         fi
-    done
+    else
+        # If target is a slug
+        local pids
+        pids=$(ps aux | grep "[l]lama-server.*$target" | awk '{print $2}')
+        if [ -z "$pids" ]; then
+            log_warn "No running server found for model '$target'."
+            return 1
+        fi
+
+        for pid in $pids; do
+            if kill "$pid" 2>/dev/null; then
+                log_info "Server for model '$target' (PID: $pid) terminated."
+            else
+                log_error "Failed to terminate server for model '$target' (PID: $pid)."
+            fi
+        done
+    fi
 }
 
 kill_all_servers() {
@@ -488,34 +549,73 @@ chat_model() {
         print_help "chat" "Start an interactive chat session with the specified model." "<slug>  The slug of the model to chat with"
         return 0
     fi
-    run_model "$slug" || return 1
+    ensure_server_running "$slug" || return 1
 
     log_info "Starting chat session. Type 'exit' to end."
-    declare -a messages=()
+    declare -a CHAT=()
 
     while true; do
-        read -rp "User: " user_input
+        read -r -e -p "User: " user_input
         [[ "$user_input" == "exit" ]] && break
 
-        messages+=("{\"role\": \"user\", \"content\": \"$user_input\"}")
-        local messages_json
-        messages_json=$(IFS=,; echo "${messages[*]}")
-
-        local response
-        response=$(api_request POST "v1/chat/completions" "{
-            \"messages\": [$messages_json],
-            \"temperature\": 0.7,
-            \"max_tokens\": 1024
-        }")
-
-        handle_response "$response" \
-            "assistant_message=\$(echo \"\$content\" | jq -r '.choices[0].message.content'); \
-             echo \"Assistant: \$assistant_message\"; \
-             messages+=(\"{\\\"role\\\": \\\"assistant\\\", \\\"content\\\": \\\"\$assistant_message\\\"}\")" \
-            "log_error \"Failed to get chat response. Status code: \$status_code\"; echo \"\$content\"; break"
+        chat_completion "$user_input"
     done
 
     log_info "Chat session ended."
+}
+
+chat_completion() {
+    local prompt="$(trim_trailing "$(format_prompt "$1")")"
+    local data="$(echo -n "$prompt" | jq -Rs --arg temp "$TEMPERATURE" --arg topk "$TOP_K" --arg topp "$TOP_P" --arg np "$N_PREDICT" '{
+        prompt: .,
+        temperature: ($temp | tonumber),
+        top_k: ($topk | tonumber),
+        top_p: ($topp | tonumber),
+        n_predict: ($np | tonumber),
+        cache_prompt: true,
+        stop: ["\n### Human:"],
+        stream: true
+    }')"
+
+    local answer=''
+    local debug_output="/tmp/chat_completion_debug.log"
+
+    echo "Sending request with data:" > "$debug_output"
+    echo "$data" >> "$debug_output"
+
+    while IFS= read -r line; do
+        echo "Received line: $line" >> "$debug_output"
+        if [[ $line = data:* ]]; then
+            local content="$(echo "${line:5}" | jq -r '.content')"
+            printf "%s" "${content}"
+            answer+="${content}"
+        elif [[ $line = error:* ]]; then
+            echo "Error: ${line:6}" >&2
+            return 1
+        fi
+    done < <(curl \
+        --silent \
+        --no-buffer \
+        --request POST \
+        --url "${API_URL}/completion" \
+        --header "Content-Type: application/json" \
+        --data-raw "${data}" 2>> "$debug_output")
+
+    if [ -z "$answer" ]; then
+        echo "No response received from the server. Check $debug_output for details." >&2
+        return 1
+    fi
+
+    printf "\n"
+
+    # Update chat history
+    CHAT+=("$1" "$(trim "$answer")")
+}
+
+format_prompt() {
+    local instruction="A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions."
+    echo -n "${instruction}"
+    printf "\n### Human: %s\n### Assistant: %s" "${CHAT[@]}" "$1"
 }
 
 complete_model() {
@@ -666,7 +766,25 @@ print_usage() {
     printf "  ${GREEN}%-26s${NC} ${DARK_GRAY}%s${NC} %s\n" "recent" "......................." "Get most recent GGUF models"
     printf "  ${GREEN}%-26s${NC} ${DARK_GRAY}%s${NC} %s\n" "trending" "......................." "Get trending GGUF models"
     echo
+    echo -e "${YELLOW}Advanced Features:${NC}"
+    printf "  ${GREEN}%-26s${NC} ${DARK_GRAY}%s${NC} %s\n" "lora <subcommand>" "......................." "Manage LoRA adapters"
+    printf "  ${GREEN}%-26s${NC} ${DARK_GRAY}%s${NC} %s\n" "metrics" "......................." "Get server metrics"
+    printf "  ${GREEN}%-26s${NC} ${DARK_GRAY}%s${NC} %s\n" "slots <subcommand>" "......................." "Manage server slots"
+    echo
     echo -e "${MAGENTA}For more information, use:${NC} gguf ${GREEN}<command> --help${NC}"
+}
+
+# Placeholder functions for new commands
+lora_command() {
+    echo "LoRA management is not implemented yet."
+}
+
+get_metrics() {
+    echo "Metrics retrieval is not implemented yet."
+}
+
+manage_slots() {
+    echo "Slot management is not implemented yet."
 }
 
 # Main Script Logic
@@ -739,6 +857,17 @@ main() {
             ;;
         trending)
             get_trending_models "$@"
+            ;;
+        lora)
+            shift
+            lora_command "$@"
+            ;;
+        metrics)
+            get_metrics
+            ;;
+        slots)
+            shift
+            manage_slots "$@"
             ;;
         *)
             print_usage
